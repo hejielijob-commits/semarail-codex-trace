@@ -1,0 +1,12 @@
+{
+  "description": "Best-effort metadata-only SemaRail Trace collection for opted-in projects.",
+  "hooks": {
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python \"${PLUGIN_ROOT}/scripts/trace_hook.py\"", "async": true, "timeout": 3}]}],
+    "PreToolUse": [{"hooks": [{"type": "command", "command": "python \"${PLUGIN_ROOT}/scripts/trace_hook.py\"", "async": true, "timeout": 3}]}],
+    "PostToolUse": [{"hooks": [{"type": "command", "command": "python \"${PLUGIN_ROOT}/scripts/trace_hook.py\"", "async": true, "timeout": 3}]}],
+    "SubagentStart": [{"hooks": [{"type": "command", "command": "python \"${PLUGIN_ROOT}/scripts/trace_hook.py\"", "async": true, "timeout": 3}]}],
+    "SubagentStop": [{"hooks": [{"type": "command", "command": "python \"${PLUGIN_ROOT}/scripts/trace_hook.py\"", "async": true, "timeout": 3}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "python \"${PLUGIN_ROOT}/scripts/trace_hook.py\"", "async": true, "timeout": 3}]}],
+    "Interrupt": [{"hooks": [{"type": "command", "command": "python \"${PLUGIN_ROOT}/scripts/trace_hook.py\"", "async": true, "timeout": 2}]}]
+  }
+}

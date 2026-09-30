@@ -1,0 +1,17 @@
+{
+  "name": "semarail-codex-trace",
+  "version": "0.1.3",
+  "description": "Send safe Codex lifecycle metadata to a project-enabled SemaRail Trace collector.",
+  "author": {
+    "name": "Local developer"
+  },
+  "interface": {
+    "displayName": "SemaRail Codex Trace",
+    "shortDescription": "Trace opted-in Codex projects in SemaRail.",
+    "longDescription": "Records turn, tool, and subagent timing and status as metadata in SemaRail for explicitly enabled projects.",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "Show me the SemaRail Trace for this Codex turn."
+  }
+}
