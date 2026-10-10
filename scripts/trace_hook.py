@@ -2,27 +2,44 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import hashlib
 import os
 import re
 import sqlite3
+import subprocess
 import sys
+import time
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 _ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_EVENT_ID = re.compile(r"^[A-Za-z0-9._:-]{1,256}$")
+_TOOL_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,127}$")
+_SECRET_TEXT = re.compile(
+    r"(?i)(bearer\s+\S+|sr_(?:live|session|key)_[A-Za-z0-9._~-]+|"
+    r"(?:postgres(?:ql)?|mysql|clickhouse)://[^\s\"']+|"
+    r"(?:password|passwd|pwd|token|secret|api[_-]?key)\s*[:=]\s*[^\s,;]+)"
+)
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 _MAX_HOOK_BYTES = 2_097_152
 _CONFIG_PATH = Path.home() / ".semarail" / "trace-projects.json"
-_STATE_PATH = Path.home() / ".semarail" / "codex-trace-routing-v1.sqlite3"
+_STATE_PATH = Path(os.environ.get("SEMARAIL_TRACE_STATE", str(Path.home() / ".semarail" / "codex-trace-routing-v1.sqlite3")))
 _ROUTE_TTL_SECONDS = 7 * 24 * 60 * 60
 _MAX_PENDING_EVENTS = 4096
 _MAX_FLUSH_EVENTS = 100
+_MAX_OUTBOX_EVENTS = 10_000
+_MAX_OUTBOX_BYTES = 20 * 1024 * 1024
+_OUTBOX_TTL_SECONDS = 7 * 24 * 60 * 60
+_WORKER_LEASE_SECONDS = 120
+_NETWORK_TIMEOUT_SECONDS = 5
 _MCP_RESULT_TTL_SECONDS = 5 * 60
 _MAX_PENDING_MCP_RESULTS = 512
 _MAX_MCP_REGISTRATIONS = 2048
@@ -35,11 +52,24 @@ class _NoRedirect(HTTPRedirectHandler):
 
 
 def _identifier(value: Any) -> str | None:
-    return value if isinstance(value, str) and _ID.fullmatch(value) else None
+    return value if isinstance(value, str) and _ID.fullmatch(value) and not _SECRET_TEXT.search(value) else None
+
+
+def _safe_metadata_id(value: Any) -> str | None:
+    identifier = _identifier(value)
+    return identifier if identifier and _SECRET_TEXT.sub("[REDACTED]", identifier) == identifier else None
+
+
+def _safe_tool_name(value: Any) -> str | None:
+    if not isinstance(value, str) or not _TOOL_NAME.fullmatch(value):
+        return None
+    return value if _SECRET_TEXT.sub("[REDACTED]", value) == value else None
 
 
 def _safe_task_path(value: Any) -> str | None:
     if not isinstance(value, str) or len(value) > 256 or not value.startswith("/"):
+        return None
+    if _SECRET_TEXT.search(value):
         return None
     parts = value.split("/")[1:]
     if not parts or any(part in {".", ".."} or not _TASK_PATH_SEGMENT.fullmatch(part) for part in parts):
@@ -59,7 +89,7 @@ def _codex_metadata_path(config: dict[str, Any]) -> Path:
 
 def _read_codex_thread_metadata(config: dict[str, Any], agent_id: str) -> tuple[str, str] | None:
     """Read only the exact child path and thread-spawn parent fields from Codex state."""
-    if _identifier(agent_id) is None:
+    if _safe_metadata_id(agent_id) is None:
         return None
     try:
         uri = _codex_metadata_path(config).resolve().as_uri() + "?mode=ro"
@@ -77,7 +107,7 @@ def _read_codex_thread_metadata(config: dict[str, Any], agent_id: str) -> tuple[
     if not row or row[0] != agent_id:
         return None
     task_path = _safe_task_path(row[1])
-    parent_id = _identifier(row[2])
+    parent_id = _safe_metadata_id(row[2])
     if task_path is None or parent_id is None:
         return None
     return task_path, parent_id
@@ -282,6 +312,25 @@ def _project_scope(config: dict[str, Any]) -> str:
     return hashlib.sha256(f"{normalized_root}\n{endpoint}\n{credential_scope}".encode("utf-8")).hexdigest()
 
 
+def _project_key(config: dict[str, Any]) -> str:
+    """Stable local key for a configured project, independent of credentials."""
+    root = config.get("root")
+    endpoint = _endpoint(config.get("endpoint")) or ""
+    if not isinstance(root, str):
+        return ""
+    try:
+        normalized_root = os.path.normcase(str(Path(root).resolve())).casefold()
+    except (OSError, ValueError):
+        normalized_root = os.path.normcase(root).casefold()
+    return hashlib.sha256(f"{normalized_root}\n{endpoint}".encode("utf-8")).hexdigest()
+
+
+def _credential_hash(config: dict[str, Any]) -> str:
+    endpoint = _endpoint(config.get("endpoint"))
+    token = _token(config, endpoint) if endpoint else None
+    return hashlib.sha256(token.encode("utf-8")).hexdigest() if token else "missing"
+
+
 def _routing_connection() -> sqlite3.Connection:
     _STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(_STATE_PATH, timeout=1.5)
@@ -299,6 +348,16 @@ def _routing_connection() -> sqlite3.Connection:
         "source_turn_id TEXT NOT NULL, event_id TEXT NOT NULL, event_type TEXT NOT NULL, "
         "event_json TEXT NOT NULL, observed_at REAL NOT NULL, "
         "PRIMARY KEY(project_scope,session_id,agent_id,source_turn_id,event_id))"
+    )
+    pending_columns = {row[1] for row in connection.execute("PRAGMA table_info(trace_pending_events)")}
+    if "project_key" not in pending_columns:
+        connection.execute("ALTER TABLE trace_pending_events ADD COLUMN project_key TEXT NOT NULL DEFAULT ''")
+    if "credential_hash" not in pending_columns:
+        connection.execute("ALTER TABLE trace_pending_events ADD COLUMN credential_hash TEXT NOT NULL DEFAULT ''")
+    if "event_bytes" not in pending_columns:
+        connection.execute("ALTER TABLE trace_pending_events ADD COLUMN event_bytes INTEGER NOT NULL DEFAULT 0")
+    connection.execute(
+        "UPDATE trace_pending_events SET event_bytes=length(CAST(event_json AS BLOB)) WHERE event_bytes=0"
     )
     connection.execute(
         "CREATE TABLE IF NOT EXISTS trace_mcp_registrations ("
@@ -327,22 +386,186 @@ def _routing_connection() -> sqlite3.Connection:
         "parent_thread_id TEXT NOT NULL, source_turn_id TEXT NOT NULL, ambiguous INTEGER NOT NULL DEFAULT 0, "
         "updated_at REAL NOT NULL, PRIMARY KEY(project_scope,session_id,agent_id))"
     )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS trace_outbox_events("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, project_key TEXT NOT NULL, credential_hash TEXT NOT NULL, "
+        "source_session_id TEXT NOT NULL, source_turn_id TEXT NOT NULL, event_id TEXT NOT NULL, "
+        "event_json TEXT NOT NULL, event_bytes INTEGER NOT NULL, created_at REAL NOT NULL, "
+        "attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at REAL NOT NULL DEFAULT 0, "
+        "state TEXT NOT NULL DEFAULT 'pending', quarantine_code INTEGER, last_attempt_at REAL, "
+        "UNIQUE(project_key,source_session_id,event_id))"
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS trace_outbox_ready ON trace_outbox_events(project_key,state,next_attempt_at,id)")
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS trace_project_state("
+        "project_key TEXT PRIMARY KEY, last_credential_hash TEXT, subject_id TEXT, organization_id TEXT, "
+        "server_project_id TEXT, paused_credential_hash TEXT, pause_reason TEXT, "
+        "dropped_expired INTEGER NOT NULL DEFAULT 0, dropped_capacity INTEGER NOT NULL DEFAULT 0, "
+        "dropped_invalid INTEGER NOT NULL DEFAULT 0, dropped_conflict INTEGER NOT NULL DEFAULT 0, "
+        "quarantined_count INTEGER NOT NULL DEFAULT 0, retry_count INTEGER NOT NULL DEFAULT 0, "
+        "last_success_at TEXT, last_status_at REAL, last_observed_at TEXT, last_worker_state TEXT)"
+    )
+    connection.execute("CREATE TABLE IF NOT EXISTS trace_local_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS trace_worker_lease("
+        "project_key TEXT PRIMARY KEY, owner_id TEXT NOT NULL, lease_until REAL NOT NULL, "
+        "wake_requested INTEGER NOT NULL DEFAULT 0)"
+    )
+    lease_columns = {row[1] for row in connection.execute("PRAGMA table_info(trace_worker_lease)")}
+    if "wake_requested" not in lease_columns:
+        connection.execute("ALTER TABLE trace_worker_lease ADD COLUMN wake_requested INTEGER NOT NULL DEFAULT 0")
+    connection.commit()
     return connection
+
+
+def _ensure_project_state(connection: sqlite3.Connection, project_key: str) -> None:
+    connection.execute("INSERT OR IGNORE INTO trace_project_state(project_key) VALUES(?)", (project_key,))
+
+
+def _record_drop(connection: sqlite3.Connection, project_key: str, reason: str, count: int = 1) -> None:
+    if reason not in {"expired", "capacity", "invalid", "conflict"} or count <= 0:
+        return
+    _ensure_project_state(connection, project_key)
+    connection.execute(f"UPDATE trace_project_state SET dropped_{reason}=dropped_{reason}+? WHERE project_key=?", (count, project_key))
+
+
+def _queue_event(event: Any) -> dict[str, Any] | None:
+    """Copy only the event schema's allowlisted metadata into durable storage."""
+    if not isinstance(event, dict):
+        return None
+    allowed = {"eventId", "occurredAt", "type", "toolUseId", "toolName", "parentAgentId", "agentId", "model", "status", "coreTraceId"}
+    if set(event) - allowed:
+        return None
+    raw_event_id = event.get("eventId")
+    event_id = raw_event_id if (
+        isinstance(raw_event_id, str) and _EVENT_ID.fullmatch(raw_event_id)
+        and _SECRET_TEXT.sub("[REDACTED]", raw_event_id) == raw_event_id
+    ) else None
+    event_type = event.get("type")
+    occurred_at = _utc_timestamp(event.get("occurredAt"))
+    if event_id is None or occurred_at is None or event_type not in {
+        "turn_started", "tool_started", "tool_completed", "subagent_started", "subagent_completed",
+        "output", "turn_completed", "turn_interrupted",
+    }:
+        return None
+    queued: dict[str, Any] = {"eventId": event_id, "occurredAt": occurred_at, "type": event_type}
+    for key in ("toolUseId", "toolName", "parentAgentId", "agentId", "model", "coreTraceId"):
+        if key not in event:
+            continue
+        value = _safe_tool_name(event[key]) if key == "toolName" else _safe_metadata_id(event[key])
+        if value is None:
+            return None
+        queued[key] = value
+    if "status" in event:
+        if event["status"] not in {"running", "success", "failure", "cancelled"}:
+            return None
+        queued["status"] = event["status"]
+    return queued
+
+
+def _prune_outbox(connection: sqlite3.Connection, project_key: str, now: float) -> None:
+    _ensure_project_state(connection, project_key)
+    cutoff = now - _OUTBOX_TTL_SECONDS
+    expired = connection.execute(
+        "SELECT COUNT(*) FROM trace_outbox_events WHERE project_key=? AND created_at<?",
+        (project_key, cutoff),
+    ).fetchone()[0]
+    if expired:
+        connection.execute("DELETE FROM trace_outbox_events WHERE project_key=? AND created_at<?", (project_key, cutoff))
+        _record_drop(connection, project_key, "expired", expired)
+    expired_routes = connection.execute(
+        "SELECT COUNT(*) FROM trace_pending_events WHERE project_key=? AND observed_at<?",
+        (project_key, cutoff),
+    ).fetchone()[0]
+    if expired_routes:
+        connection.execute("DELETE FROM trace_pending_events WHERE project_key=? AND observed_at<?", (project_key, cutoff))
+        _record_drop(connection, project_key, "expired", expired_routes)
+    while True:
+        outbox_count, outbox_bytes, route_count, route_bytes = connection.execute(
+            "SELECT COUNT(*),COALESCE(SUM(event_bytes),0) FROM trace_outbox_events WHERE project_key=?",
+            (project_key,),
+        ).fetchone() + connection.execute(
+            "SELECT COUNT(*),COALESCE(SUM(event_bytes),0) FROM trace_pending_events WHERE project_key=?",
+            (project_key,),
+        ).fetchone()
+        count = outbox_count + route_count
+        byte_count = outbox_bytes + route_bytes
+        if count <= _MAX_OUTBOX_EVENTS and byte_count <= _MAX_OUTBOX_BYTES:
+            return
+        oldest = connection.execute(
+            "SELECT source,row_id FROM ("
+            "SELECT 'outbox' AS source,id AS row_id,created_at FROM trace_outbox_events WHERE project_key=? "
+            "UNION ALL SELECT 'route' AS source,rowid AS row_id,observed_at AS created_at "
+            "FROM trace_pending_events WHERE project_key=?) ORDER BY created_at,row_id LIMIT 1",
+            (project_key, project_key),
+        ).fetchone()
+        if oldest is None:
+            return
+        if oldest[0] == "outbox":
+            connection.execute("DELETE FROM trace_outbox_events WHERE id=?", (oldest[1],))
+        else:
+            connection.execute("DELETE FROM trace_pending_events WHERE rowid=?", (oldest[1],))
+        _record_drop(connection, project_key, "capacity")
+
+
+def _enqueue_payload(
+    connection: sqlite3.Connection, config: dict[str, Any], session_id: str, turn_id: str,
+    events: list[dict[str, Any]], now: float, identity_turn_id: str | None = None,
+    credential_hash_override: str | None = None,
+) -> int:
+    project_key = _project_key(config)
+    if not project_key:
+        return 0
+    if any(_safe_metadata_id(value) is None for value in (session_id, turn_id, identity_turn_id or turn_id)):
+        for _event in events:
+            _record_drop(connection, project_key, "invalid")
+        return 0
+    _ensure_project_state(connection, project_key)
+    credential_hash = credential_hash_override if credential_hash_override is not None else _credential_hash(config)
+    inserted = 0
+    for event in events:
+        queued = _queue_event(event)
+        if queued is None:
+            _record_drop(connection, project_key, "invalid")
+            continue
+        stable_id = "codex-" + hashlib.sha256(
+            f"{session_id}\n{identity_turn_id or turn_id}\n{queued['eventId']}".encode("utf-8")
+        ).hexdigest()
+        queued["eventId"] = stable_id
+        event_json = json.dumps(queued, separators=(",", ":"), sort_keys=True)
+        event_bytes = len(event_json.encode("utf-8"))
+        prior = connection.execute(
+            "SELECT event_json FROM trace_outbox_events WHERE project_key=? AND source_session_id=? AND event_id=?",
+            (project_key, session_id, stable_id),
+        ).fetchone()
+        if prior is not None:
+            if prior[0] != event_json:
+                _record_drop(connection, project_key, "conflict")
+            continue
+        connection.execute(
+            "INSERT INTO trace_outbox_events(project_key,credential_hash,source_session_id,source_turn_id,event_id,event_json,event_bytes,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (project_key, credential_hash, session_id, turn_id, stable_id, event_json, event_bytes, now),
+        )
+        inserted += 1
+        _prune_outbox(connection, project_key, now)
+    return inserted
 
 
 def _prune_routing_state(connection: sqlite3.Connection, now: float) -> None:
     cutoff = now - _ROUTE_TTL_SECONDS
-    connection.execute("DELETE FROM trace_pending_events WHERE observed_at < ?", (cutoff,))
+    # Clean pre-v2 unresolved route rows that lack a stable project key.
+    connection.execute("DELETE FROM trace_pending_events WHERE project_key='' AND observed_at<?", (cutoff,))
+    connection.execute(
+        "DELETE FROM trace_pending_events WHERE project_key='' AND rowid IN ("
+        "SELECT rowid FROM trace_pending_events WHERE project_key='' ORDER BY observed_at DESC LIMIT -1 OFFSET ?)",
+        (_MAX_PENDING_EVENTS,),
+    )
     connection.execute("DELETE FROM trace_agent_routes WHERE updated_at < ?", (cutoff,))
     connection.execute("DELETE FROM trace_mcp_registrations WHERE registered_at < ?", (now - _MCP_RESULT_TTL_SECONDS,))
     connection.execute("DELETE FROM trace_pending_mcp_results WHERE observed_at < ?", (now - _MCP_RESULT_TTL_SECONDS,))
     connection.execute("DELETE FROM trace_spawn_paths WHERE updated_at < ?", (cutoff,))
     connection.execute("DELETE FROM trace_agent_metadata WHERE updated_at < ?", (cutoff,))
-    connection.execute(
-        "DELETE FROM trace_pending_events WHERE rowid IN ("
-        "SELECT rowid FROM trace_pending_events ORDER BY observed_at DESC LIMIT -1 OFFSET ?)",
-        (_MAX_PENDING_EVENTS,),
-    )
     connection.execute(
         "DELETE FROM trace_pending_mcp_results WHERE rowid IN ("
         "SELECT rowid FROM trace_pending_mcp_results ORDER BY observed_at DESC LIMIT -1 OFFSET ?)",
@@ -470,14 +693,33 @@ def _set_event_parent(event: dict[str, Any], parent_agent_id: str | None) -> dic
 
 def _store_pending_events(
     connection: sqlite3.Connection, project_scope: str, session_id: str, agent_id: str,
-    turn_id: str, events: list[dict[str, Any]], now: float,
+    turn_id: str, events: list[dict[str, Any]], now: float, config: dict[str, Any],
 ) -> None:
-    connection.executemany(
-        "INSERT OR IGNORE INTO trace_pending_events(project_scope,session_id,agent_id,source_turn_id,event_id,event_type,event_json,observed_at) "
-        "VALUES(?,?,?,?,?,?,?,?)",
-        ((project_scope, session_id, agent_id, turn_id, event["eventId"], event["type"],
-          json.dumps(event, separators=(",", ":")), now) for event in events),
-    )
+    project_key = _project_key(config)
+    credential_hash = _credential_hash(config)
+    _ensure_project_state(connection, project_key)
+    for event in events:
+        queued = _queue_event(event)
+        if queued is None:
+            _record_drop(connection, project_key, "invalid")
+            continue
+        event_json = json.dumps(queued, separators=(",", ":"), sort_keys=True)
+        prior = connection.execute(
+            "SELECT event_json FROM trace_pending_events WHERE project_scope=? AND session_id=? AND agent_id=? "
+            "AND source_turn_id=? AND event_id=?",
+            (project_scope, session_id, agent_id, turn_id, queued["eventId"]),
+        ).fetchone()
+        if prior is not None:
+            if prior[0] != event_json:
+                _record_drop(connection, project_key, "conflict")
+            continue
+        connection.execute(
+            "INSERT INTO trace_pending_events(project_scope,session_id,agent_id,source_turn_id,event_id,event_type,event_json,observed_at,project_key,credential_hash,event_bytes) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (project_scope, session_id, agent_id, turn_id, queued["eventId"], queued["type"], event_json,
+             now, project_key, credential_hash, len(event_json.encode("utf-8"))),
+        )
+    _prune_outbox(connection, project_key, now)
 
 
 def _bind_unambiguous_pending_start(
@@ -500,9 +742,9 @@ def _bind_unambiguous_pending_start(
 
 def _flush_routed_events(
     connection: sqlite3.Connection, project_scope: str, session_id: str,
-) -> list[tuple[str, list[tuple[str, str, dict[str, Any]]]]]:
+) -> list[tuple[str, list[tuple[str, str, str, dict[str, Any]]]]]:
     rows = connection.execute(
-        "SELECT pending.agent_id,pending.source_turn_id,pending.event_id,pending.event_json,route.root_turn_id,route.parent_agent_id "
+        "SELECT pending.agent_id,pending.source_turn_id,pending.event_id,pending.event_json,pending.credential_hash,route.root_turn_id,route.parent_agent_id "
         "FROM trace_pending_events AS pending JOIN trace_agent_routes AS route "
         "ON route.project_scope=pending.project_scope AND route.session_id=pending.session_id "
         "AND route.agent_id=pending.agent_id AND route.bound_turn_id=pending.source_turn_id "
@@ -511,8 +753,8 @@ def _flush_routed_events(
         "ORDER BY pending.observed_at,pending.event_id LIMIT ?",
         (project_scope, session_id, _MAX_FLUSH_EVENTS),
     ).fetchall()
-    batches: dict[str, list[tuple[str, str, dict[str, Any]]]] = {}
-    for agent_id, source_turn_id, event_id, event_json, root_turn_id, parent_agent_id in rows:
+    batches: dict[str, list[tuple[str, str, str, dict[str, Any]]]] = {}
+    for agent_id, source_turn_id, event_id, event_json, credential_hash, root_turn_id, parent_agent_id in rows:
         try:
             event = json.loads(event_json)
         except ValueError:
@@ -524,7 +766,7 @@ def _flush_routed_events(
             continue
         if isinstance(event, dict):
             _set_event_parent(event, parent_agent_id)
-            batches.setdefault(root_turn_id, []).append((agent_id, source_turn_id, event))
+            batches.setdefault(root_turn_id, []).append((agent_id, source_turn_id, credential_hash, event))
     return [(root_turn, events) for root_turn, events in batches.items()]
 
 
@@ -716,11 +958,25 @@ def _record_spawn_path(
 
 
 def _dispatch_hook(session_id: str, turn_id: str, hook: dict[str, Any], config: dict[str, Any]) -> None:
+    if _safe_metadata_id(session_id) is None or _safe_metadata_id(turn_id) is None:
+        project_key = _project_key(config)
+        if project_key:
+            connection: sqlite3.Connection | None = None
+            try:
+                connection = _routing_connection()
+                _record_drop(connection, project_key, "invalid")
+                connection.commit()
+            except (OSError, sqlite3.Error):
+                pass
+            finally:
+                if connection is not None:
+                    connection.close()
+        return
     events = _events(hook)
     name = hook.get("hook_event_name")
     agent_id = _identifier(hook.get("agent_id"))
     project_scope = _project_scope(config)
-    tool_name = hook.get("tool_name")
+    tool_name = _safe_tool_name(hook.get("tool_name"))
     spawned_agent_id = _spawned_agent_id(tool_name, hook.get("tool_response")) if name == "PostToolUse" else None
     spawned_task_path = (
         _spawned_task_path(tool_name, hook.get("tool_response"))
@@ -740,13 +996,15 @@ def _dispatch_hook(session_id: str, turn_id: str, hook: dict[str, Any], config: 
         }
 
     connection: sqlite3.Connection | None = None
+    queued = False
     try:
         connection = _routing_connection()
         connection.execute("BEGIN IMMEDIATE")
         _prune_routing_state(connection, now)
+        _prune_outbox(connection, _project_key(config), now)
         if name == "PreToolUse":
             call_id = _identifier(hook.get("tool_use_id"))
-            registered_tool_name = _identifier(hook.get("tool_name"))
+            registered_tool_name = _safe_tool_name(hook.get("tool_name"))
             if call_id and registered_tool_name:
                 buffered_mcp_completion = _register_mcp_call(
                     connection, project_scope, session_id, turn_id, call_id, agent_id,
@@ -816,7 +1074,7 @@ def _dispatch_hook(session_id: str, turn_id: str, hook: dict[str, Any], config: 
             routed_events = [*events]
             if buffered_mcp_completion is not None:
                 routed_events.append(buffered_mcp_completion)
-            _store_pending_events(connection, project_scope, session_id, agent_id, turn_id, routed_events, now)
+            _store_pending_events(connection, project_scope, session_id, agent_id, turn_id, routed_events, now, config)
             _bind_unambiguous_pending_start(connection, project_scope, session_id, agent_id, now)
         elif buffered_mcp_completion is not None:
             if direct_payload is None:
@@ -826,6 +1084,9 @@ def _dispatch_hook(session_id: str, turn_id: str, hook: dict[str, Any], config: 
                 }
             direct_payload["events"].append(buffered_mcp_completion)
         pending_batches = _flush_routed_events(connection, project_scope, session_id)
+        if direct_payload is not None:
+            queued += _enqueue_payload(connection, config, session_id, turn_id, direct_payload["events"], now)
+        queued += _persist_routed_batches(connection, config, project_scope, session_id, pending_batches, now)
         connection.commit()
     except (OSError, sqlite3.Error, TypeError, ValueError):
         if connection is not None:
@@ -834,22 +1095,67 @@ def _dispatch_hook(session_id: str, turn_id: str, hook: dict[str, Any], config: 
             except sqlite3.Error:
                 pass
         # Collection stays best effort if local routing state is unavailable.
-        if direct_payload is not None:
-            _send(config, direct_payload)
         return
     finally:
         if connection is not None:
             connection.close()
 
-    if direct_payload is not None:
-        _send(config, direct_payload)
-    for root_turn_id, routed_batch in pending_batches:
-        batch = [event for _agent_id, _source_turn_id, event in routed_batch]
-        if _send(config, {
-            "schemaVersion": 1, "source": "codex", "sourceSessionId": session_id,
-            "sourceTurnId": root_turn_id, "events": batch,
-        }):
-            _ack_pending_events(project_scope, session_id, routed_batch)
+    if queued or events or buffered_mcp_completion is not None:
+        _launch_worker(config)
+
+
+def _persist_routed_batches(
+    connection: sqlite3.Connection, config: dict[str, Any], project_scope: str, session_id: str,
+    batches: list[tuple[str, list[tuple[str, str, str, dict[str, Any]]]]], now: float,
+) -> int:
+    queued = 0
+    for root_turn_id, routed_batch in batches:
+        by_source_turn: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for agent_id, source_turn_id, credential_hash, event in routed_batch:
+            by_source_turn.setdefault((source_turn_id, credential_hash), []).append(event)
+        for (source_turn_id, credential_hash), events in by_source_turn.items():
+            queued += _enqueue_payload(
+                connection, config, session_id, root_turn_id, events, now,
+                identity_turn_id=source_turn_id, credential_hash_override=credential_hash,
+            )
+        connection.executemany(
+            "DELETE FROM trace_pending_events WHERE project_scope=? AND session_id=? AND agent_id=? "
+            "AND source_turn_id=? AND event_id=?",
+            ((project_scope, session_id, agent_id, source_turn_id, event["eventId"])
+             for agent_id, source_turn_id, _credential_hash, event in routed_batch),
+        )
+    return queued
+
+
+def _drain_ready_routed_events(config: dict[str, Any], project_key: str) -> int:
+    """Move every currently attributable child event into the durable outbox."""
+    now = time.time()
+    connection: sqlite3.Connection | None = None
+    queued = 0
+    try:
+        connection = _routing_connection()
+        connection.execute("BEGIN IMMEDIATE")
+        _prune_routing_state(connection, now)
+        _prune_outbox(connection, project_key, now)
+        groups = connection.execute(
+            "SELECT DISTINCT project_scope,session_id FROM trace_pending_events WHERE project_key=?",
+            (project_key,),
+        ).fetchall()
+        for project_scope, session_id in groups:
+            batches = _flush_routed_events(connection, project_scope, session_id)
+            queued += _persist_routed_batches(connection, config, project_scope, session_id, batches, now)
+        connection.commit()
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        if connection is not None:
+            try:
+                connection.rollback()
+            except sqlite3.Error:
+                pass
+        return 0
+    finally:
+        if connection is not None:
+            connection.close()
+    return queued
 
 
 def _ack_pending_events(project_scope: str, session_id: str, events: list[tuple[str, str, dict[str, Any]]]) -> None:
@@ -964,18 +1270,23 @@ def _publish_registered_mcp_event(
     connection: sqlite3.Connection | None = None
     direct_payload: dict[str, Any] | None = None
     pending_batches: list[tuple[str, list[tuple[str, str, dict[str, Any]]]]] = []
+    queued = 0
     try:
         connection = _routing_connection()
         connection.execute("BEGIN IMMEDIATE")
         _prune_routing_state(connection, now)
+        _prune_outbox(connection, _project_key(config), now)
         if agent_id is None:
             direct_payload = {
                 "schemaVersion": 1, "source": "codex", "sourceSessionId": session_id,
                 "sourceTurnId": turn_id, "events": [event],
             }
         else:
-            _store_pending_events(connection, project_scope, session_id, agent_id, turn_id, [event], now)
+            _store_pending_events(connection, project_scope, session_id, agent_id, turn_id, [event], now, config)
             pending_batches = _flush_routed_events(connection, project_scope, session_id)
+        if direct_payload is not None:
+            queued += _enqueue_payload(connection, config, session_id, turn_id, direct_payload["events"], now)
+        queued += _persist_routed_batches(connection, config, project_scope, session_id, pending_batches, now)
         connection.commit()
     except (OSError, sqlite3.Error, TypeError, ValueError):
         if connection is not None:
@@ -987,15 +1298,8 @@ def _publish_registered_mcp_event(
     finally:
         if connection is not None:
             connection.close()
-    if direct_payload is not None:
-        _send(config, direct_payload)
-    for root_turn_id, routed_batch in pending_batches:
-        batch = [pending_event for _agent, _source_turn, pending_event in routed_batch]
-        if _send(config, {
-            "schemaVersion": 1, "source": "codex", "sourceSessionId": session_id,
-            "sourceTurnId": root_turn_id, "events": batch,
-        }):
-            _ack_pending_events(project_scope, session_id, routed_batch)
+    if queued or direct_payload is not None or pending_batches:
+        _launch_worker(config)
 
 
 def _observe_mcp_result(
@@ -1010,12 +1314,12 @@ def _observe_mcp_result(
         return
     if not isinstance(metadata, dict) or not isinstance(result, dict):
         return
-    call_id = _identifier(metadata.get("callId"))
-    session_id = _identifier(metadata.get("sessionId"))
-    turn_id = _identifier(metadata.get("turnId"))
+    call_id = _safe_metadata_id(metadata.get("callId"))
+    session_id = _safe_metadata_id(metadata.get("sessionId"))
+    turn_id = _safe_metadata_id(metadata.get("turnId"))
     raw_agent_id = metadata.get("agentId")
-    agent_id = _identifier(raw_agent_id) if raw_agent_id is not None else None
-    trace_id = _identifier(result.get("traceId"))
+    agent_id = _safe_metadata_id(raw_agent_id) if raw_agent_id is not None else None
+    trace_id = _safe_metadata_id(result.get("traceId"))
     is_error = result.get("isError")
     timestamp = _utc_timestamp(occurred_at)
     if (call_id is None or session_id is None or turn_id is None or trace_id is None
@@ -1091,7 +1395,7 @@ def _events(hook: dict[str, Any]) -> list[dict[str, Any]]:
     now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     model = _identifier(hook.get("model"))
     tool_id = _identifier(hook.get("tool_use_id"))
-    tool_name = _identifier(hook.get("tool_name"))
+    tool_name = _safe_tool_name(hook.get("tool_name"))
     agent_id = _identifier(hook.get("agent_id"))
     parent_agent_id = _identifier(hook.get("parent_agent_id"))
 
@@ -1124,22 +1428,753 @@ def _send(config: dict[str, Any], payload: dict[str, Any]) -> bool:
     token = _token(config, endpoint)
     if token is None:
         return False
-    request = Request(
-        endpoint + "/api/v1/traces/events",
-        data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        method="POST",
-    )
+    status, _body = _api_request(config, "/api/v1/traces/events", payload)
+    return status is not None and 200 <= status < 300
+
+
+def _api_request(
+    config: dict[str, Any], path: str, body: dict[str, Any] | None = None,
+    token_override: str | None = None,
+) -> tuple[int | None, dict[str, Any] | None]:
+    endpoint = _endpoint(config.get("endpoint"))
+    token = token_override if token_override is not None else (_token(config, endpoint) if endpoint else None)
+    if endpoint is None or token is None:
+        return None, None
+    data = json.dumps(body, separators=(",", ":")).encode("utf-8") if body is not None else None
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    request = Request(endpoint + path, data=data, headers=headers, method="POST" if body is not None else "GET")
     try:
-        with build_opener(_NoRedirect()).open(request, timeout=1.5) as response:
-            response.read(1024)
-        return True
+        with build_opener(_NoRedirect()).open(request, timeout=_NETWORK_TIMEOUT_SECONDS) as response:
+            status = int(response.status)
+            raw = response.read(64 * 1024)
+    except HTTPError as exc:
+        # Error bodies can contain server diagnostics or user-controlled text;
+        # they are deliberately never read, persisted, or reported.
+        status = int(exc.code)
+        exc.close()
+        return status, None
+    except (OSError, URLError, ValueError):
+        return None, None
+    if not raw:
+        return status, None
+    try:
+        decoded = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return status, None
+    return status, decoded if isinstance(decoded, dict) else None
+
+
+def _all_project_configs() -> list[dict[str, Any]]:
+    raw_path = os.environ.get("SEMARAIL_TRACE_CONFIG")
+    path = Path(raw_path) if raw_path else _CONFIG_PATH
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        # Observability must never change Codex's tool or turn outcome.
+        return []
+    projects = config.get("projects") if isinstance(config, dict) else None
+    return [project for project in projects if isinstance(project, dict) and project.get("enabled") is True] if isinstance(projects, list) else []
+
+
+def _config_for_project(project_key: str) -> dict[str, Any] | None:
+    for config in _all_project_configs():
+        if _project_key(config) == project_key and _endpoint(config.get("endpoint")) is not None:
+            return config
+    return None
+
+
+def _launch_worker(config: dict[str, Any]) -> None:
+    project_key = _project_key(config)
+    if not project_key:
+        return
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = _routing_connection()
+        connection.execute("BEGIN IMMEDIATE")
+        lease = connection.execute(
+            "SELECT lease_until FROM trace_worker_lease WHERE project_key=?", (project_key,),
+        ).fetchone()
+        if lease is not None and lease[0] > time.time():
+            connection.execute("UPDATE trace_worker_lease SET wake_requested=1 WHERE project_key=?", (project_key,))
+            connection.commit()
+            return
+        connection.commit()
+    except (OSError, sqlite3.Error):
+        if connection is not None:
+            try:
+                connection.rollback()
+            except sqlite3.Error:
+                pass
+        return
+    finally:
+        if connection is not None:
+            connection.close()
+    args = [sys.executable, str(Path(__file__).resolve()), "--worker", project_key]
+    try:
+        if os.name == "nt":
+            flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             close_fds=True, creationflags=flags)
+        else:
+            subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             close_fds=True, start_new_session=True)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+
+
+def _collector_id(connection: sqlite3.Connection) -> str:
+    row = connection.execute("SELECT value FROM trace_local_meta WHERE key='collector_id'").fetchone()
+    if row and _identifier(row[0]):
+        return row[0]
+    value = str(uuid.uuid4())
+    connection.execute("INSERT OR REPLACE INTO trace_local_meta(key,value) VALUES('collector_id',?)", (value,))
+    return value
+
+
+def _set_project_pause(project_key: str, reason: str, credential_hash: str) -> None:
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = _routing_connection()
+        _ensure_project_state(connection, project_key)
+        connection.execute(
+            "UPDATE trace_project_state SET pause_reason=?,paused_credential_hash=?,last_worker_state=? WHERE project_key=?",
+            (reason, credential_hash, "paused", project_key),
+        )
+        connection.commit()
+    except (OSError, sqlite3.Error):
+        pass
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _queued_credential_hashes(connection: sqlite3.Connection, project_key: str) -> set[str]:
+    return {row[0] for row in connection.execute(
+        "SELECT DISTINCT credential_hash FROM trace_outbox_events WHERE project_key=? UNION "
+        "SELECT DISTINCT credential_hash FROM trace_pending_events WHERE project_key=?",
+        (project_key, project_key),
+    )}
+
+
+def _validate_identity(config: dict[str, Any], project_key: str) -> tuple[bool, str, str | None]:
+    endpoint = _endpoint(config.get("endpoint"))
+    token = _token(config, endpoint) if endpoint else None
+    credential_hash = hashlib.sha256(token.encode("utf-8")).hexdigest() if token else "missing"
+    if token is None:
+        _set_project_pause(project_key, "credential_missing", credential_hash)
+        return False, "credential_missing", None
+
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = _routing_connection()
+        _ensure_project_state(connection, project_key)
+        state = connection.execute(
+            "SELECT last_credential_hash,subject_id,organization_id,server_project_id,pause_reason,paused_credential_hash "
+            "FROM trace_project_state WHERE project_key=?", (project_key,),
+        ).fetchone()
+        queued_hashes = _queued_credential_hashes(connection, project_key)
+    except (OSError, sqlite3.Error):
+        return False, "database_unavailable", None
+    finally:
+        if connection is not None:
+            connection.close()
+
+    last_hash, subject_id, organization_id, server_project_id, pause_reason, paused_credential_hash = state
+    bound_identity = all((subject_id, organization_id, server_project_id))
+    credential_changed = last_hash is not None and last_hash != credential_hash
+    queued_changed = any(value != credential_hash for value in queued_hashes)
+    recognized_hashes = {credential_hash, "missing"}
+    if last_hash:
+        recognized_hashes.add(last_hash)
+    if any(value not in recognized_hashes for value in queued_hashes):
+        # Another hook may have observed a newer credential than this detached
+        # worker inherited. Its hash alone cannot authorize replay under this token.
+        _set_project_pause(project_key, "unbound_credential", credential_hash)
+        return False, "unbound_credential", None
+    if (credential_changed or queued_changed) and not bound_identity:
+        _set_project_pause(project_key, "unbound_credential", credential_hash)
+        return False, "unbound_credential", None
+
+    if pause_reason == "authentication" and paused_credential_hash == credential_hash:
+        return False, "authentication", None
+
+    if not credential_changed and not queued_changed and bound_identity:
+        connection = _routing_connection()
+        try:
+            connection.execute(
+                "UPDATE trace_project_state SET pause_reason=NULL,paused_credential_hash=NULL,last_worker_state='ready' WHERE project_key=?",
+                (project_key,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        return True, "ready", token
+
+    status, capabilities = _api_request(config, "/api/v1/auth/capabilities", token_override=token)
+    if status in (401, 403):
+        _set_project_pause(project_key, "authentication", credential_hash)
+        return False, "authentication", None
+    if status is None or status < 200 or status >= 300:
+        _set_project_pause(project_key, "identity_unavailable", credential_hash)
+        return False, "identity_unavailable", None
+    subject = capabilities.get("subject") if isinstance(capabilities, dict) else None
+    identity = (
+        _identifier(subject.get("id")) if isinstance(subject, dict) else None,
+        _identifier(subject.get("organizationId")) if isinstance(subject, dict) else None,
+        _identifier(capabilities.get("projectId")) if isinstance(capabilities, dict) else None,
+    )
+    if not all(identity):
+        _set_project_pause(project_key, "identity_unavailable", credential_hash)
+        return False, "identity_unavailable", None
+    if bound_identity and identity != (subject_id, organization_id, server_project_id):
+        _set_project_pause(project_key, "identity_changed", credential_hash)
+        return False, "identity_changed", None
+
+    connection = None
+    try:
+        connection = _routing_connection()
+        connection.execute("BEGIN IMMEDIATE")
+        _ensure_project_state(connection, project_key)
+        current_state = connection.execute(
+            "SELECT last_credential_hash,subject_id,organization_id,server_project_id "
+            "FROM trace_project_state WHERE project_key=?", (project_key,),
+        ).fetchone()
+        current_hashes = _queued_credential_hashes(connection, project_key)
+        if current_state is None or tuple(current_state) != tuple(state[:4]):
+            connection.execute(
+                "UPDATE trace_project_state SET pause_reason='unbound_credential',paused_credential_hash=?,last_worker_state='paused' WHERE project_key=?",
+                (credential_hash, project_key),
+            )
+            connection.commit()
+            return False, "unbound_credential", None
+        if any(value not in recognized_hashes for value in current_hashes):
+            # A hook can enqueue while capabilities is in flight. Its hash was
+            # not covered by this identity response, so leave it untouched.
+            connection.execute(
+                "UPDATE trace_project_state SET pause_reason='unbound_credential',paused_credential_hash=?,last_worker_state='paused' WHERE project_key=?",
+                (credential_hash, project_key),
+            )
+            connection.commit()
+            return False, "unbound_credential", None
+        connection.execute(
+            "UPDATE trace_project_state SET last_credential_hash=?,subject_id=?,organization_id=?,server_project_id=?, "
+            "pause_reason=NULL,paused_credential_hash=NULL,last_worker_state='ready' WHERE project_key=?",
+            (credential_hash, *identity, project_key),
+        )
+        # Rebind only hashes covered by the snapshot and this successful
+        # identity check. Unknown hashes are never rewritten to the active one.
+        allowed_hashes = sorted(recognized_hashes)
+        placeholders = ",".join("?" for _ in allowed_hashes)
+        connection.execute(
+            f"UPDATE trace_outbox_events SET credential_hash=? WHERE project_key=? AND credential_hash IN ({placeholders})",
+            (credential_hash, project_key, *allowed_hashes),
+        )
+        connection.execute(
+            f"UPDATE trace_pending_events SET credential_hash=? WHERE project_key=? AND credential_hash IN ({placeholders})",
+            (credential_hash, project_key, *allowed_hashes),
+        )
+        connection.commit()
+    except (OSError, sqlite3.Error):
+        return False, "database_unavailable", None
+    finally:
+        if connection is not None:
+            connection.close()
+    return True, "ready", token
+
+
+def _mark_network_retry(project_key: str, row_ids: list[int], attempt: int, now: float) -> None:
+    delay = min(30, 2 ** max(0, attempt - 1))
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = _routing_connection()
+        connection.executemany(
+            "UPDATE trace_outbox_events SET attempts=attempts+1,next_attempt_at=?,last_attempt_at=? WHERE id=? AND state='pending'",
+            ((now + delay, now, row_id) for row_id in row_ids),
+        )
+        _ensure_project_state(connection, project_key)
+        connection.execute("UPDATE trace_project_state SET retry_count=retry_count+?,last_worker_state='retrying' WHERE project_key=?", (len(row_ids), project_key))
+        connection.commit()
+    except (OSError, sqlite3.Error):
+        pass
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _quarantine_batch(project_key: str, row_ids: list[int], status: int) -> None:
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = _routing_connection()
+        connection.executemany(
+            "UPDATE trace_outbox_events SET state='quarantined',quarantine_code=? WHERE id=? AND state='pending'",
+            ((status, row_id) for row_id in row_ids),
+        )
+        _ensure_project_state(connection, project_key)
+        if status == 409:
+            _record_drop(connection, project_key, "conflict", len(row_ids))
+        elif status in (400, 422):
+            _record_drop(connection, project_key, "invalid", len(row_ids))
+        connection.execute("UPDATE trace_project_state SET quarantined_count=quarantined_count+?,last_worker_state='quarantined' WHERE project_key=?", (len(row_ids), project_key))
+        connection.commit()
+    except (OSError, sqlite3.Error):
+        pass
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _worker_lease(project_key: str) -> str | None:
+    owner = str(uuid.uuid4())
+    now = time.time()
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = _routing_connection()
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute("SELECT owner_id,lease_until FROM trace_worker_lease WHERE project_key=?", (project_key,)).fetchone()
+        if row is not None and row[1] > now:
+            connection.rollback()
+            return None
+        connection.execute(
+            "INSERT OR REPLACE INTO trace_worker_lease(project_key,owner_id,lease_until,wake_requested) VALUES(?,?,?,0)",
+            (project_key, owner, now + _WORKER_LEASE_SECONDS),
+        )
+        connection.commit()
+        return owner
+    except (OSError, sqlite3.Error):
+        if connection is not None:
+            try:
+                connection.rollback()
+            except sqlite3.Error:
+                pass
+        return None
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _renew_worker_lease(project_key: str, owner: str) -> bool:
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = _routing_connection()
+        cursor = connection.execute(
+            "UPDATE trace_worker_lease SET lease_until=? WHERE project_key=? AND owner_id=?",
+            (time.time() + _WORKER_LEASE_SECONDS, project_key, owner),
+        )
+        connection.commit()
+        return cursor.rowcount == 1
+    except (OSError, sqlite3.Error):
         return False
+    finally:
+        if connection is not None:
+            connection.close()
 
 
-def main() -> None:
+def _release_worker_lease(project_key: str, owner: str) -> None:
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = _routing_connection()
+        connection.execute("DELETE FROM trace_worker_lease WHERE project_key=? AND owner_id=?", (project_key, owner))
+        connection.commit()
+    except (OSError, sqlite3.Error):
+        pass
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _finish_worker_if_idle(project_key: str, owner: str) -> bool:
+    """Release the lease atomically with the final queue check."""
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = _routing_connection()
+        connection.execute("BEGIN IMMEDIATE")
+        lease = connection.execute(
+            "SELECT wake_requested FROM trace_worker_lease WHERE project_key=? AND owner_id=?",
+            (project_key, owner),
+        ).fetchone()
+        if lease is None:
+            connection.rollback()
+            return True
+        pending = connection.execute(
+            "SELECT COUNT(*) FROM trace_outbox_events WHERE project_key=? AND state='pending' AND next_attempt_at<=?",
+            (project_key, time.time()),
+        ).fetchone()[0]
+        if lease[0] or pending:
+            connection.execute("UPDATE trace_worker_lease SET wake_requested=0 WHERE project_key=? AND owner_id=?", (project_key, owner))
+            connection.commit()
+            return False
+        connection.execute("DELETE FROM trace_worker_lease WHERE project_key=? AND owner_id=?", (project_key, owner))
+        connection.commit()
+        return True
+    except (OSError, sqlite3.Error):
+        if connection is not None:
+            try:
+                connection.rollback()
+            except sqlite3.Error:
+                pass
+        return True
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _next_outbox_delay(project_key: str, now: float) -> float | None:
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = _routing_connection()
+        row = connection.execute(
+            "SELECT MIN(next_attempt_at) FROM trace_outbox_events WHERE project_key=? AND state='pending'",
+            (project_key,),
+        ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        return max(0.0, float(row[0]) - now)
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return None
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _outbox_batch(project_key: str, now: float, credential_hash: str) -> tuple[list[int], dict[str, Any]] | None:
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = _routing_connection()
+        first = connection.execute(
+            "SELECT id,source_session_id,source_turn_id FROM trace_outbox_events "
+            "WHERE project_key=? AND credential_hash=? AND state='pending' AND next_attempt_at<=? ORDER BY created_at,id LIMIT 1",
+            (project_key, credential_hash, now),
+        ).fetchone()
+        if first is None:
+            return None
+        rows = connection.execute(
+            "SELECT id,event_json FROM trace_outbox_events WHERE project_key=? AND state='pending' "
+            "AND credential_hash=? AND source_session_id=? AND source_turn_id=? AND next_attempt_at<=? ORDER BY created_at,id LIMIT ?",
+            (project_key, credential_hash, first[1], first[2], now, _MAX_FLUSH_EVENTS),
+        ).fetchall()
+        events = [json.loads(row[1]) for row in rows]
+        payload = {
+            "schemaVersion": 1, "source": "codex", "sourceSessionId": first[1],
+            "sourceTurnId": first[2], "events": events,
+        }
+        return [row[0] for row in rows], payload
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return None
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _ack_batch(project_key: str, row_ids: list[int]) -> None:
+    connection: sqlite3.Connection | None = None
+    success_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    try:
+        connection = _routing_connection()
+        connection.executemany("DELETE FROM trace_outbox_events WHERE id=?", ((row_id,) for row_id in row_ids))
+        _ensure_project_state(connection, project_key)
+        connection.execute("UPDATE trace_project_state SET last_success_at=?,last_worker_state='ready' WHERE project_key=?", (success_at, project_key))
+        connection.commit()
+    except (OSError, sqlite3.Error):
+        pass
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _collector_status_payload(connection: sqlite3.Connection, project_key: str) -> dict[str, Any]:
+    _ensure_project_state(connection, project_key)
+    row = connection.execute(
+        "SELECT dropped_expired,dropped_capacity,dropped_invalid,dropped_conflict,quarantined_count,retry_count,last_success_at,pause_reason "
+        "FROM trace_project_state WHERE project_key=?", (project_key,),
+    ).fetchone()
+    pending = connection.execute(
+        "SELECT COUNT(*) FROM trace_outbox_events WHERE project_key=? AND state='pending'", (project_key,),
+    ).fetchone()[0] + connection.execute(
+        "SELECT COUNT(*) FROM trace_pending_events WHERE project_key=?", (project_key,),
+    ).fetchone()[0]
+    quarantined = connection.execute(
+        "SELECT COUNT(*) FROM trace_outbox_events WHERE project_key=? AND state='quarantined'", (project_key,),
+    ).fetchone()[0]
+    paused = pending if row[7] is not None else 0
+    dropped = row[0] + row[1] + row[2] + row[3]
+    return {
+        "schemaVersion": 1, "collectorId": _collector_id(connection),
+        "observedAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "pendingCount": pending, "retryCount": row[5], "droppedCount": dropped,
+        "pausedCount": paused, "quarantinedCount": quarantined,
+        "lastSuccessAt": row[6],
+        "dropReasons": {"expired": row[0], "capacity": row[1], "invalid": row[2], "conflict": row[3]},
+    }
+
+
+def _send_collector_status(config: dict[str, Any], project_key: str, token_override: str | None = None) -> int | None:
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = _routing_connection()
+        payload = _collector_status_payload(connection, project_key)
+        connection.commit()
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return None
+    finally:
+        if connection is not None:
+            connection.close()
+    status, _response = _api_request(config, "/api/v1/traces/collector-status", payload, token_override=token_override)
+    connection = None
+    try:
+        connection = _routing_connection()
+        if status is not None and 200 <= status < 300:
+            connection.execute("UPDATE trace_project_state SET last_status_at=?,last_observed_at=?,last_worker_state='ready' WHERE project_key=?",
+                               (time.time(), payload["observedAt"], project_key))
+        elif status in (401, 403):
+            active_hash = hashlib.sha256(token_override.encode("utf-8")).hexdigest() if token_override else _credential_hash(config)
+            connection.execute("UPDATE trace_project_state SET pause_reason='authentication',paused_credential_hash=?,last_worker_state='paused' WHERE project_key=?",
+                               (active_hash, project_key))
+        else:
+            connection.execute("UPDATE trace_project_state SET last_worker_state='status_unavailable' WHERE project_key=?", (project_key,))
+        connection.commit()
+    except (OSError, sqlite3.Error):
+        pass
+    finally:
+        if connection is not None:
+            connection.close()
+    return status
+
+
+def _run_worker(project_key: str, max_attempts: int | None = None) -> int:
+    config = _config_for_project(project_key)
+    if config is None:
+        return 2
+    owner = _worker_lease(project_key)
+    if owner is None:
+        return 0
+    try:
+        failures = 0
+        exit_code = 0
+        token: str | None = None
+        while owner is not None and _renew_worker_lease(project_key, owner):
+            ready, state, token = _validate_identity(config, project_key)
+            if not ready:
+                if state in {"identity_changed", "unbound_credential", "authentication", "credential_missing", "database_unavailable"}:
+                    exit_code = 3 if state in {"identity_changed", "unbound_credential"} else 1
+                    break
+                failures += 1
+                if max_attempts is not None and failures >= max_attempts:
+                    exit_code = 4
+                    break
+                time.sleep(min(30, 2 ** (failures - 1)))
+                continue
+            _drain_ready_routed_events(config, project_key)
+            verified_hash = hashlib.sha256(token.encode("utf-8")).hexdigest() if token else "missing"
+            batch = _outbox_batch(project_key, time.time(), verified_hash)
+            if batch is None:
+                delay = _next_outbox_delay(project_key, time.time())
+                if delay is not None:
+                    if max_attempts is not None:
+                        if token is not None:
+                            _send_collector_status(config, project_key, token)
+                        exit_code = 4
+                        break
+                    if delay > 0:
+                        time.sleep(min(30, max(0.05, delay)))
+                    continue
+                if token is not None:
+                    status_status = _send_collector_status(config, project_key, token)
+                    if status_status in (401, 403):
+                        exit_code = 1
+                        break
+                if _finish_worker_if_idle(project_key, owner):
+                    # The helper removed this lease atomically with the final
+                    # queue check. Do not delete a lease acquired by a new
+                    # worker after that transaction commits.
+                    owner = None
+                    break
+                continue
+            row_ids, payload = batch
+            status, _body = _api_request(config, "/api/v1/traces/events", payload, token_override=token)
+            if status is not None and 200 <= status < 300:
+                _ack_batch(project_key, row_ids)
+                failures = 0
+                continue
+            if status in (401, 403):
+                credential_hash = hashlib.sha256(token.encode("utf-8")).hexdigest() if token else "missing"
+                _set_project_pause(project_key, "authentication", credential_hash)
+                break
+            if status is not None and 400 <= status < 500 and status not in {408, 429}:
+                _quarantine_batch(project_key, row_ids, status)
+                failures = 0
+                continue
+            failures += 1
+            _mark_network_retry(project_key, row_ids, failures, time.time())
+            if token is not None:
+                status_status = _send_collector_status(config, project_key, token)
+                if status_status in (401, 403):
+                    exit_code = 1
+                    break
+            if max_attempts is not None and failures >= max_attempts:
+                exit_code = 4
+                break
+            time.sleep(min(30, 2 ** (failures - 1)))
+        return exit_code
+    except Exception:
+        return 1
+    finally:
+        if owner is not None:
+            _release_worker_lease(project_key, owner)
+
+
+def _local_status() -> dict[str, Any]:
+    now = time.time()
+    configs = {key: config for config in _all_project_configs() if (key := _project_key(config))}
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = _routing_connection()
+        items: list[dict[str, Any]] = []
+        for project_key, configured in [(key, True) for key in configs]:
+            items.append(_local_project_status(connection, project_key, configured, now))
+        known = set(configs)
+        orphan_keys = {row[0] for row in connection.execute(
+            "SELECT project_key FROM trace_outbox_events UNION SELECT project_key FROM trace_pending_events WHERE project_key<>''"
+        ) if row[0] not in known}
+        items.extend(_local_project_status(connection, key, False, now) for key in sorted(orphan_keys))
+        return {"schemaVersion": 1, "checkedAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"), "projects": items}
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _local_project_status(connection: sqlite3.Connection, project_key: str, configured: bool, now: float) -> dict[str, Any]:
+    state = connection.execute(
+        "SELECT pause_reason,last_worker_state,last_status_at,last_observed_at,last_success_at "
+        "FROM trace_project_state WHERE project_key=?", (project_key,),
+    ).fetchone()
+    pending = connection.execute(
+        "SELECT COUNT(*),COALESCE(SUM(attempts),0),COALESCE(MIN(next_attempt_at),0) "
+        "FROM trace_outbox_events WHERE project_key=? AND state='pending'", (project_key,),
+    ).fetchone()
+    quarantine = connection.execute(
+        "SELECT COUNT(*) FROM trace_outbox_events WHERE project_key=? AND state='quarantined'", (project_key,),
+    ).fetchone()[0]
+    routed = connection.execute("SELECT COUNT(*) FROM trace_pending_events WHERE project_key=?", (project_key,)).fetchone()[0]
+    pending_count = pending[0] + routed
+    lease = connection.execute("SELECT lease_until FROM trace_worker_lease WHERE project_key=?", (project_key,)).fetchone()
+    last_status_at = state[2] if state else None
+    stale = last_status_at is None or now - last_status_at > 300
+    if state and state[0]:
+        worker_state = "paused"
+    elif not configured:
+        worker_state = "project_unconfigured"
+    elif pending_count:
+        worker_state = state[1] or "queued"
+    else:
+        worker_state = state[1] if state and state[1] else "idle_unreported"
+    return {
+        "projectKey": project_key[:12], "configured": configured,
+        "queuePresent": bool(pending_count or quarantine), "pendingCount": pending_count,
+        "retryCount": pending[1], "quarantinedCount": quarantine,
+        "paused": bool(state and state[0]), "pauseReason": state[0] if state else None,
+        "workerState": worker_state, "workerLeaseActive": bool(lease and lease[0] > now),
+        "statusStale": stale, "lastStatusAt": _epoch_to_iso(last_status_at),
+        "lastObservedAt": state[3] if state else None, "lastSuccessAt": state[4] if state else None,
+    }
+
+
+def _epoch_to_iso(value: Any) -> str | None:
+    if not isinstance(value, (int, float)):
+        return None
+    return datetime.fromtimestamp(value, UTC).isoformat().replace("+00:00", "Z")
+
+
+def _local_clean(clear_all: bool = False) -> dict[str, int]:
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = _routing_connection()
+        connection.execute("BEGIN IMMEDIATE")
+        before = connection.execute("SELECT COUNT(*) FROM trace_outbox_events").fetchone()[0] + connection.execute("SELECT COUNT(*) FROM trace_pending_events").fetchone()[0]
+        if clear_all:
+            connection.execute("DELETE FROM trace_outbox_events")
+            connection.execute("DELETE FROM trace_pending_events")
+            connection.execute("DELETE FROM trace_mcp_registrations")
+            connection.execute("DELETE FROM trace_pending_mcp_results")
+            connection.execute("DELETE FROM trace_agent_routes")
+            connection.execute("DELETE FROM trace_spawn_paths")
+            connection.execute("DELETE FROM trace_agent_metadata")
+        else:
+            now = time.time()
+            keys = {row[0] for row in connection.execute("SELECT project_key FROM trace_outbox_events UNION SELECT project_key FROM trace_pending_events WHERE project_key<>''")}
+            for project_key in keys:
+                _prune_outbox(connection, project_key, now)
+            _prune_routing_state(connection, now)
+            connection.execute("DELETE FROM trace_outbox_events WHERE state='quarantined' AND created_at<?", (now - _OUTBOX_TTL_SECONDS,))
+        after = connection.execute("SELECT COUNT(*) FROM trace_outbox_events").fetchone()[0] + connection.execute("SELECT COUNT(*) FROM trace_pending_events").fetchone()[0]
+        connection.commit()
+        return {"removedEvents": before - after, "remainingEvents": after}
+    except (OSError, sqlite3.Error):
+        if connection is not None:
+            try:
+                connection.rollback()
+            except sqlite3.Error:
+                pass
+        return {"removedEvents": 0, "remainingEvents": -1}
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _cli(args: list[str]) -> int:
+    if args and args[0] == "--worker":
+        if len(args) < 2 or not re.fullmatch(r"[0-9a-f]{64}", args[1]):
+            return 2
+        return _run_worker(args[1])
+    parser = argparse.ArgumentParser(description="Inspect or flush the local SemaRail Trace queue.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("status", help="Show local queue and collector freshness without contacting the server.")
+    flush = subparsers.add_parser("flush", help="Try to send queued events now.")
+    flush.add_argument("--project", help="Limit the flush to a configured project root.")
+    clean = subparsers.add_parser("clean", help="Remove expired local data; --all also clears queued events.")
+    clean.add_argument("--all", action="store_true", help="Clear all queued and routing metadata from this device.")
+    parsed = parser.parse_args(args)
+    try:
+        if parsed.command == "status":
+            print(json.dumps(_local_status(), indent=2))
+            return 0
+        if parsed.command == "clean":
+            print(json.dumps(_local_clean(parsed.all), indent=2))
+            return 0
+        configs = _all_project_configs()
+        if parsed.project:
+            selected = Path(parsed.project).expanduser().resolve()
+            configs = [config for config in configs if isinstance(config.get("root"), str) and Path(config["root"]).expanduser().resolve() == selected]
+        results = []
+        for config in configs:
+            key = _project_key(config)
+            if key:
+                result = _run_worker(key, max_attempts=1)
+                connection = _routing_connection()
+                try:
+                    state = _local_project_status(connection, key, True, time.time())
+                finally:
+                    connection.close()
+                if state["paused"] or result != 0:
+                    outcome = "paused_or_unavailable"
+                elif state["pendingCount"] == 0:
+                    outcome = "flushed"
+                elif state["workerLeaseActive"]:
+                    outcome = "worker_active"
+                else:
+                    outcome = "queued"
+                results.append({"projectKey": key[:12], "result": outcome})
+        print(json.dumps({"schemaVersion": 1, "projects": results}, indent=2))
+        return 0 if all(item["result"] in {"flushed", "worker_active"} for item in results) else 1
+    except (OSError, ValueError, sqlite3.Error):
+        print(json.dumps({"error": "local_trace_state_unavailable"}))
+        return 1
+
+
+def main(argv: list[str] | None = None) -> None:
+    cli_args = sys.argv[1:] if argv is None else argv
+    if cli_args:
+        raise SystemExit(_cli(cli_args))
     requires_json_output = False
     try:
         raw = sys.stdin.buffer.read(_MAX_HOOK_BYTES + 1)
@@ -1149,8 +2184,8 @@ def main() -> None:
         if not isinstance(hook, dict):
             return
         requires_json_output = hook.get("hook_event_name") in {"Stop", "SubagentStop"}
-        session_id = _identifier(hook.get("session_id"))
-        turn_id = _identifier(hook.get("turn_id"))
+        session_id = _safe_metadata_id(hook.get("session_id"))
+        turn_id = _safe_metadata_id(hook.get("turn_id"))
         if session_id is None or turn_id is None:
             return
         config = _project_config(hook.get("cwd"))

@@ -20,6 +20,22 @@ _SPEC.loader.exec_module(trace_hook)
 
 
 class TraceHookTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.worker_patch = patch.object(trace_hook, "_launch_worker", side_effect=self._drain_test_outbox)
+        self.worker_patch.start()
+        self.addCleanup(self.worker_patch.stop)
+
+    def _drain_test_outbox(self, config: dict) -> None:
+        project_key = trace_hook._project_key(config)
+        while True:
+            batch = trace_hook._outbox_batch(project_key, trace_hook.time.time(), trace_hook._credential_hash(config))
+            if batch is None:
+                return
+            row_ids, payload = batch
+            if not trace_hook._send(config, payload):
+                return
+            trace_hook._ack_batch(project_key, row_ids)
+
     def test_tool_event_discards_arguments_and_result_bodies(self) -> None:
         hook = {
             "hook_event_name": "PostToolUse", "session_id": "thr-1", "turn_id": "turn-1",
@@ -68,6 +84,10 @@ class TraceHookTests(unittest.TestCase):
         self.assertIsNone(trace_hook._safe_task_path("/root/../private/body"))
         self.assertIsNone(trace_hook._safe_task_path("root/trace_shape_child"))
         self.assertIsNone(trace_hook._safe_task_path("/root/private prompt"))
+        for task_path in ("/root/sr_live_" + "a" * 24 + "_" + "b" * 32,
+                          "/root/password:PRIVATE_CREDENTIAL"):
+            self.assertIsNone(trace_hook._safe_task_path(task_path))
+            self.assertIsNone(trace_hook._spawned_task_path("collaborationspawn_agent", {"task_name": task_path}))
 
     def test_spawn_task_path_is_read_only_from_the_collaboration_result(self) -> None:
         self.assertEqual(
@@ -550,7 +570,7 @@ class TraceHookTests(unittest.TestCase):
                 self.assertEqual(sent[0]["sourceTurnId"], "turn-1")
                 self.assertEqual([event["type"] for event in sent[0]["events"]], ["tool_started", "tool_completed"])
                 completed = sent[0]["events"][1]
-                self.assertEqual(completed["eventId"], "mcp-result:call-1")
+                self.assertRegex(completed["eventId"], r"^codex-[0-9a-f]{64}$")
                 self.assertEqual(completed["toolUseId"], "call-1")
                 self.assertEqual(completed["toolName"], "mcp__semarail__query_run")
                 self.assertEqual(completed["status"], "success")
@@ -618,7 +638,7 @@ class TraceHookTests(unittest.TestCase):
                 }, config)
                 self.assertEqual(len(sent), 1)
                 self.assertEqual(sent[0]["sourceTurnId"], "turn-2")
-                self.assertEqual(sent[0]["events"][-1]["eventId"], "mcp-result:call-2")
+                self.assertRegex(sent[0]["events"][-1]["eventId"], r"^codex-[0-9a-f]{64}$")
                 self.assertEqual(sent[0]["events"][-1]["status"], "failure")
                 self.assertEqual(sent[0]["events"][-1]["coreTraceId"], "trace-2")
 
@@ -637,7 +657,7 @@ class TraceHookTests(unittest.TestCase):
             }
             stdin = io.TextIOWrapper(io.BytesIO(json.dumps(hook).encode()), encoding="utf-8")
             with patch.dict("os.environ", {"SEMARAIL_TRACE_CONFIG": str(config)}), patch.object(trace_hook, "_STATE_PATH", Path(temp) / "routing.sqlite3"), patch.object(trace_hook.sys, "stdin", stdin), patch.object(trace_hook, "_send") as send:
-                trace_hook.main()
+                trace_hook.main([])
             sent = send.call_args.args[1]
             self.assertEqual(sent["events"][0]["coreTraceId"], "trace-owned")
             encoded = json.dumps(sent)
@@ -651,7 +671,7 @@ class TraceHookTests(unittest.TestCase):
         with (patch.object(trace_hook.sys, "stdin", stdin), patch.object(trace_hook.sys, "stdout", stdout),
               patch.object(trace_hook, "_project_config", return_value={"enabled": True}),
               patch.object(trace_hook, "_dispatch_hook", side_effect=RuntimeError("collector unavailable"))):
-            trace_hook.main()
+            trace_hook.main([])
         self.assertEqual(stdout.getvalue(), "{}\n")
 
 

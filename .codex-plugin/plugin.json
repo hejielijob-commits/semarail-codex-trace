@@ -1,6 +1,6 @@
 {
   "name": "semarail-codex-trace",
-  "version": "0.1.3",
+  "version": "0.2.2",
   "description": "Send safe Codex lifecycle metadata to a project-enabled SemaRail Trace collector.",
   "author": {
     "name": "Local developer"

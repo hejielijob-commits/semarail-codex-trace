@@ -83,12 +83,31 @@ class TraceMCPTests(unittest.TestCase):
             state_path = Path(temporary) / "routing.sqlite3"
             sent: list[dict] = []
             completion_sent = threading.Event()
+            worker_saw_pending: list[int] = []
 
             def send(_config: dict, payload: dict) -> bool:
                 sent.append(payload)
                 if any(event.get("type") == "tool_completed" for event in payload.get("events", [])):
                     completion_sent.set()
                 return True
+
+            def drain_outbox(_config: dict) -> None:
+                project_key = adapter._project_key(config)
+                connection = adapter._routing_connection()
+                try:
+                    worker_saw_pending.append(connection.execute(
+                        "SELECT COUNT(*) FROM trace_outbox_events WHERE project_key=?", (project_key,),
+                    ).fetchone()[0])
+                finally:
+                    connection.close()
+                while True:
+                    batch = adapter._outbox_batch(project_key, adapter.time.time(), adapter._credential_hash(config))
+                    if batch is None:
+                        return
+                    row_ids, payload = batch
+                    if not adapter._send(config, payload):
+                        return
+                    adapter._ack_batch(project_key, row_ids)
 
             with (
                 patch.dict(sys.modules, {"trace_hook": adapter}),
@@ -97,6 +116,7 @@ class TraceMCPTests(unittest.TestCase):
                 patch.object(adapter, "_project_config", return_value=config),
                 patch.object(adapter, "_token", return_value="sr_session_test"),
                 patch.object(adapter, "_send", side_effect=send),
+                patch.object(adapter, "_launch_worker", side_effect=drain_outbox),
             ):
                 callback = trace_mcp._load_callback()
                 self.assertIs(callback, adapter._observe_mcp_result)
@@ -114,6 +134,7 @@ class TraceMCPTests(unittest.TestCase):
 
             completed = [event for batch in sent for event in batch.get("events", []) if event.get("type") == "tool_completed"]
             self.assertEqual(len(completed), 1)
+            self.assertEqual(worker_saw_pending, [1, 1])
             self.assertEqual(completed[0]["toolUseId"], "call-integrated")
             self.assertEqual(completed[0]["coreTraceId"], "trace-1")
             self.assertEqual(completed[0]["status"], "failure")
